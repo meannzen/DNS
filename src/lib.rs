@@ -1,3 +1,6 @@
+#![allow(dead_code)]
+#![allow(clippy::missing_const_for_fn)]
+
 #[derive(Debug)]
 pub enum BufferError {
     EndOfBuffer,
@@ -85,23 +88,59 @@ pub struct Question {
     qclass: QClass,
 }
 
-struct Message {
-    header: DnsHeader,
-    question: Question,
-}
-
-pub struct MessageWriter {
-    message: Message,
-}
-
-impl MessageWriter {
-    pub fn new(header: DnsHeader, question: Question) -> MessageWriter {
-        MessageWriter {
-            message: Message { header, question },
+impl Question {
+    pub fn new(name: &str) -> Question {
+        Question {
+            qname: name.to_string(),
+            qtype: QType::A,
+            qclass: QClass::IN,
         }
     }
 
-    pub fn write(&self, buf: &mut [u8]) -> Result<usize> {
+    pub fn with_type_class(name: &str, qtype: QType, qclass: QClass) -> Question {
+        Question {
+            qname: name.to_string(),
+            qtype,
+            qclass,
+        }
+    }
+
+    pub fn encode_qname(&self, buf: &mut [u8]) -> Result<usize> {
+        encode_domain_name(&self.qname, buf)
+    }
+}
+
+pub enum RData {
+    A([u8; 4]),
+    CNAME(String),
+    Unknown(Vec<u8>),
+}
+
+pub struct Answer {
+    qname: String,
+    qtype: QType,
+    qclass: QClass,
+    ttl: u32,
+    rdata: RData,
+}
+
+impl Answer {
+    pub fn new(name: &str, addr: [u8; 4], ttl: u32) -> Answer {
+        Answer {
+            qname: name.to_string(),
+            qtype: QType::A,
+            qclass: QClass::IN,
+            ttl,
+            rdata: RData::A(addr),
+        }
+    }
+
+    pub fn encode(&self, buf: &mut [u8]) -> Result<usize> {
+        let mut off = 0usize;
+
+        let written = encode_domain_name(&self.qname, &mut buf[off..])?;
+        off += written;
+
         fn write_u16(buf: &mut [u8], off: usize, val: u16) -> Result<()> {
             if off + 2 > buf.len() {
                 return Err(BufferError::EndOfBuffer);
@@ -111,6 +150,109 @@ impl MessageWriter {
             buf[off + 1] = bytes[1];
             Ok(())
         }
+        fn write_u32(buf: &mut [u8], off: usize, val: u32) -> Result<()> {
+            if off + 4 > buf.len() {
+                return Err(BufferError::EndOfBuffer);
+            }
+            let bytes = val.to_be_bytes();
+            buf[off..off + 4].copy_from_slice(&bytes);
+            Ok(())
+        }
+
+        let t = match self.qtype {
+            QType::A => 1u16,
+            QType::CNAME => 5u16,
+        };
+        write_u16(buf, off, t)?;
+        off += 2;
+
+        let c = match self.qclass {
+            QClass::IN => 1u16,
+            QClass::CS => 2u16,
+        };
+        write_u16(buf, off, c)?;
+        off += 2;
+
+        write_u32(buf, off, self.ttl)?;
+        off += 4;
+
+        let rdlength_pos = off;
+        off += 2;
+
+        let rdata_start = off;
+        match &self.rdata {
+            RData::A(a) => {
+                if off + 4 > buf.len() {
+                    return Err(BufferError::EndOfBuffer);
+                }
+                buf[off..off + 4].copy_from_slice(a);
+                off += 4;
+            }
+            RData::CNAME(name) => {
+                let written = encode_domain_name(name, &mut buf[off..])?;
+                off += written;
+            }
+            RData::Unknown(bytes) => {
+                if off + bytes.len() > buf.len() {
+                    return Err(BufferError::EndOfBuffer);
+                }
+                buf[off..off + bytes.len()].copy_from_slice(bytes);
+                off += bytes.len();
+            }
+        }
+
+        let rdlen = (off - rdata_start) as u16;
+        if rdlength_pos + 2 > buf.len() {
+            return Err(BufferError::EndOfBuffer);
+        }
+        let rdbytes = rdlen.to_be_bytes();
+        buf[rdlength_pos] = rdbytes[0];
+        buf[rdlength_pos + 1] = rdbytes[1];
+
+        Ok(off)
+    }
+}
+
+struct Message {
+    header: DnsHeader,
+    question: Question,
+    answer: Answer,
+}
+
+pub struct MessageWriter {
+    message: Message,
+}
+
+impl MessageWriter {
+    pub fn new(header: DnsHeader, question: Question, answer: Answer) -> MessageWriter {
+        MessageWriter {
+            message: Message {
+                header,
+                question,
+                answer,
+            },
+        }
+    }
+
+    pub fn write(&self, buf: &mut [u8]) -> Result<usize> {
+        // helpers
+        fn write_u16(buf: &mut [u8], off: usize, val: u16) -> Result<()> {
+            if off + 2 > buf.len() {
+                return Err(BufferError::EndOfBuffer);
+            }
+            let bytes = val.to_be_bytes();
+            buf[off] = bytes[0];
+            buf[off + 1] = bytes[1];
+            Ok(())
+        }
+        fn write_u32(buf: &mut [u8], off: usize, val: u32) -> Result<()> {
+            if off + 4 > buf.len() {
+                return Err(BufferError::EndOfBuffer);
+            }
+            let bytes = val.to_be_bytes();
+            buf[off..off + 4].copy_from_slice(&bytes);
+            Ok(())
+        }
 
         let mut offset = 0usize;
 
@@ -118,9 +260,11 @@ impl MessageWriter {
             return Err(BufferError::EndOfBuffer);
         }
 
+        // ID
         write_u16(buf, offset, self.message.header.packet_id)?;
         offset += 2;
 
+        // Flags
         let mut flags: u16 = 0;
         if self.message.header.query_response_indicator {
             flags |= 1 << 15;
@@ -144,18 +288,32 @@ impl MessageWriter {
         write_u16(buf, offset, flags)?;
         offset += 2;
 
+        // QDCOUNT
         write_u16(buf, offset, self.message.header.question_count)?;
         offset += 2;
-        write_u16(buf, offset, self.message.header.answer_record_count)?;
+
+        // ANCOUNT: if header has 0 but we have an answer, we assume 1
+        let ancount = if self.message.header.answer_record_count == 0 {
+            1u16
+        } else {
+            self.message.header.answer_record_count
+        };
+        write_u16(buf, offset, ancount)?;
         offset += 2;
+
+        // NSCOUNT
         write_u16(buf, offset, self.message.header.authority_record_count)?;
         offset += 2;
+
+        // ARCOUNT
         write_u16(buf, offset, self.message.header.additional_record_count)?;
         offset += 2;
 
+        // Question section
         let written_qname = self.message.question.encode_qname(&mut buf[offset..])?;
         offset += written_qname;
 
+        // QTYPE
         let qtype_u16 = match self.message.question.qtype {
             QType::A => 1u16,
             QType::CNAME => 5u16,
@@ -163,12 +321,16 @@ impl MessageWriter {
         write_u16(buf, offset, qtype_u16)?;
         offset += 2;
 
+        // QCLASS
         let qclass_u16 = match self.message.question.qclass {
             QClass::IN => 1u16,
             QClass::CS => 2u16,
         };
         write_u16(buf, offset, qclass_u16)?;
         offset += 2;
+
+        let answer_written = self.message.answer.encode(&mut buf[offset..])?;
+        offset += answer_written;
 
         Ok(offset)
     }
@@ -178,50 +340,6 @@ impl MessageWriter {
         let len = self.write(&mut buf)?;
         buf.truncate(len);
         Ok(buf)
-    }
-}
-
-impl Question {
-    pub fn new(name: &str) -> Question {
-        Question {
-            qname: name.to_string(),
-            qtype: QType::A,
-            qclass: QClass::IN,
-        }
-    }
-
-    pub fn with_type_class(name: &str, qtype: QType, qclass: QClass) -> Question {
-        Question {
-            qname: name.to_string(),
-            qtype,
-            qclass,
-        }
-    }
-
-    pub fn encode_qname(&self, buf: &mut [u8]) -> Result<usize> {
-        let mut offset = 0usize;
-
-        for label in self.qname.split('.') {
-            let len = label.len();
-            if len == 0 {
-                continue;
-            }
-            if offset + 1 + len > buf.len() {
-                return Err(BufferError::EndOfBuffer);
-            }
-            buf[offset] = len as u8;
-            offset += 1;
-            buf[offset..offset + len].copy_from_slice(label.as_bytes());
-            offset += len;
-        }
-
-        if offset >= buf.len() {
-            return Err(BufferError::EndOfBuffer);
-        }
-        buf[offset] = 0;
-        offset += 1;
-
-        Ok(offset)
     }
 }
 
@@ -278,4 +396,30 @@ impl DnsHeader {
             additional_record_count: 0,
         }
     }
+}
+
+fn encode_domain_name(name: &str, buf: &mut [u8]) -> Result<usize> {
+    let mut offset = 0usize;
+
+    for label in name.split('.') {
+        let len = label.len();
+        if len == 0 {
+            continue;
+        }
+        if offset + 1 + len > buf.len() {
+            return Err(BufferError::EndOfBuffer);
+        }
+        buf[offset] = len as u8;
+        offset += 1;
+        buf[offset..offset + len].copy_from_slice(label.as_bytes());
+        offset += len;
+    }
+
+    if offset >= buf.len() {
+        return Err(BufferError::EndOfBuffer);
+    }
+    buf[offset] = 0;
+    offset += 1;
+
+    Ok(offset)
 }
