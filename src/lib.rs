@@ -226,8 +226,8 @@ impl Answer {
 
 struct Message {
     header: DnsHeader,
-    question: Question,
-    answer: Answer,
+    questions: Vec<Question>,
+    answers: Vec<Answer>,
 }
 
 pub struct MessageWriter {
@@ -239,14 +239,27 @@ impl MessageWriter {
         MessageWriter {
             message: Message {
                 header,
-                question,
-                answer,
+                questions: vec![question],
+                answers: vec![answer],
+            },
+        }
+    }
+
+    pub fn new_with_sections(
+        header: DnsHeader,
+        questions: Vec<Question>,
+        answers: Vec<Answer>,
+    ) -> MessageWriter {
+        MessageWriter {
+            message: Message {
+                header,
+                questions,
+                answers,
             },
         }
     }
 
     pub fn write(&self, buf: &mut [u8]) -> Result<usize> {
-        // helpers
         fn write_u16(buf: &mut [u8], off: usize, val: u16) -> Result<()> {
             if off + 2 > buf.len() {
                 return Err(BufferError::EndOfBuffer);
@@ -271,11 +284,9 @@ impl MessageWriter {
             return Err(BufferError::EndOfBuffer);
         }
 
-        // ID
         write_u16(buf, offset, self.message.header.packet_id)?;
         offset += 2;
 
-        // Flags
         let mut flags: u16 = 0;
         if self.message.header.query_response_indicator {
             flags |= 1 << 15;
@@ -299,50 +310,61 @@ impl MessageWriter {
         write_u16(buf, offset, flags)?;
         offset += 2;
 
-        // QDCOUNT
-        write_u16(buf, offset, self.message.header.question_count)?;
+        let qdcount = if self.message.header.question_count != 0 {
+            self.message.header.question_count
+        } else {
+            self.message.questions.len() as u16
+        };
+        write_u16(buf, offset, qdcount)?;
         offset += 2;
 
-        // ANCOUNT: if header has 0 but we have an answer, we assume 1
-        let ancount = if self.message.header.answer_record_count == 0 {
-            1u16
-        } else {
+        let ancount = if self.message.header.answer_record_count != 0 {
             self.message.header.answer_record_count
+        } else {
+            self.message.answers.len() as u16
         };
         write_u16(buf, offset, ancount)?;
         offset += 2;
 
-        // NSCOUNT
-        write_u16(buf, offset, self.message.header.authority_record_count)?;
-        offset += 2;
-
-        // ARCOUNT
-        write_u16(buf, offset, self.message.header.additional_record_count)?;
-        offset += 2;
-
-        // Question section
-        let written_qname = self.message.question.encode_qname(&mut buf[offset..])?;
-        offset += written_qname;
-
-        // QTYPE
-        let qtype_u16 = match self.message.question.qtype {
-            QType::A => 1u16,
-            QType::CNAME => 5u16,
+        let nscount = if self.message.header.authority_record_count != 0 {
+            self.message.header.authority_record_count
+        } else {
+            0u16
         };
-        write_u16(buf, offset, qtype_u16)?;
+        write_u16(buf, offset, nscount)?;
         offset += 2;
 
-        // QCLASS
-        let qclass_u16 = match self.message.question.qclass {
-            QClass::IN => 1u16,
-            QClass::CS => 2u16,
+        let arcount = if self.message.header.additional_record_count != 0 {
+            self.message.header.additional_record_count
+        } else {
+            0u16
         };
-        write_u16(buf, offset, qclass_u16)?;
+        write_u16(buf, offset, arcount)?;
         offset += 2;
 
-        // Answer section (write one answer if present)
-        let answer_written = self.message.answer.encode(&mut buf[offset..])?;
-        offset += answer_written;
+        for q in &self.message.questions {
+            let written_qname = q.encode_qname(&mut buf[offset..])?;
+            offset += written_qname;
+
+            let qtype_u16 = match q.qtype {
+                QType::A => 1u16,
+                QType::CNAME => 5u16,
+            };
+            write_u16(buf, offset, qtype_u16)?;
+            offset += 2;
+
+            let qclass_u16 = match q.qclass {
+                QClass::IN => 1u16,
+                QClass::CS => 2u16,
+            };
+            write_u16(buf, offset, qclass_u16)?;
+            offset += 2;
+        }
+
+        for a in &self.message.answers {
+            let answer_written = a.encode(&mut buf[offset..])?;
+            offset += answer_written;
+        }
 
         Ok(offset)
     }
@@ -392,14 +414,22 @@ impl DnsHeader {
     }
 
     pub fn response_with_id(id: u16) -> DnsHeader {
-        DnsHeader::response_with_id_full(id, 0, false)
+        DnsHeader::response_with_id_and_counts(id, 0, false, 1, 0, 0, 0)
     }
 
     pub fn response_with_id_and_rd(id: u16, recursion_desired: bool) -> DnsHeader {
-        DnsHeader::response_with_id_full(id, 0, recursion_desired)
+        DnsHeader::response_with_id_and_counts(id, 0, recursion_desired, 1, 0, 0, 0)
     }
 
-    pub fn response_with_id_full(id: u16, opcode: u8, recursion_desired: bool) -> DnsHeader {
+    pub fn response_with_id_and_counts(
+        id: u16,
+        opcode: u8,
+        recursion_desired: bool,
+        qdcount: u16,
+        ancount: u16,
+        nscount: u16,
+        arcount: u16,
+    ) -> DnsHeader {
         let response_code = if opcode == 0 { 0 } else { 4 };
         DnsHeader {
             packet_id: id,
@@ -411,11 +441,15 @@ impl DnsHeader {
             recursion_available: false,
             reserved: 0,
             response_code,
-            question_count: 1,
-            answer_record_count: 0,
-            authority_record_count: 0,
-            additional_record_count: 0,
+            question_count: qdcount,
+            answer_record_count: ancount,
+            authority_record_count: nscount,
+            additional_record_count: arcount,
         }
+    }
+
+    pub fn response_with_id_full(id: u16, opcode: u8, recursion_desired: bool) -> DnsHeader {
+        DnsHeader::response_with_id_and_counts(id, opcode, recursion_desired, 1, 0, 0, 0)
     }
 }
 

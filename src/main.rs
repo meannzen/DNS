@@ -133,42 +133,56 @@ fn main() {
                     continue;
                 }
 
-                let qstart = 12usize;
-                let (qname, after_name) = match parse_name(packet, qstart) {
-                    Ok((n, p)) => (n, p),
-                    Err(e) => {
-                        eprintln!("Failed to parse QNAME from {}: {}", src, e);
-                        continue;
-                    }
-                };
+                let mut questions: Vec<Question> = Vec::new();
+                let mut answers: Vec<Answer> = Vec::new();
+                let mut pos = 12usize;
+                let qdcount_usize = qdcount as usize;
+                let mut failed = false;
 
-                if after_name + 4 > packet.len() {
-                    eprintln!(
-                        "Packet from {} truncated after qname (need 4 more bytes, have {})",
-                        src,
-                        packet.len() - after_name
-                    );
+                for _ in 0..qdcount_usize {
+                    match parse_name(packet, pos) {
+                        Ok((qname, next_pos)) => {
+                            pos = next_pos;
+                            if pos + 4 > packet.len() {
+                                eprintln!(
+                                    "Packet from {} truncated while reading QTYPE/QCLASS",
+                                    src
+                                );
+                                failed = true;
+                                break;
+                            }
+                            let qtype_u16 = u16::from_be_bytes([packet[pos], packet[pos + 1]]);
+                            let qclass_u16 = u16::from_be_bytes([packet[pos + 2], packet[pos + 3]]);
+                            let qtype = qtype_from_u16(qtype_u16).unwrap_or(QType::A);
+                            let qclass = qclass_from_u16(qclass_u16).unwrap_or(QClass::IN);
+                            pos += 4;
+
+                            questions.push(Question::with_type_class(&qname, qtype, qclass));
+
+                            let ip_suffix = (answers.len() as u8).wrapping_add(1);
+                            let ip = [1u8, 2u8, 3u8, ip_suffix];
+                            answers.push(Answer::new(&qname, ip, 60));
+
+                            println!(
+                                "Parsed question from {}: name='{}' qtype={} qclass={}",
+                                src, qname, qtype_u16, qclass_u16
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to parse QNAME from {}: {}", src, e);
+                            failed = true;
+                            break;
+                        }
+                    }
+                }
+
+                if failed {
                     continue;
                 }
 
-                let qtype_u16 = u16::from_be_bytes([packet[after_name], packet[after_name + 1]]);
-                let qclass_u16 =
-                    u16::from_be_bytes([packet[after_name + 2], packet[after_name + 3]]);
-
-                let qtype = qtype_from_u16(qtype_u16).unwrap_or(QType::A);
-                let qclass = qclass_from_u16(qclass_u16).unwrap_or(QClass::IN);
-
-                println!(
-                    "Query from {}: id={}, name='{}', qtype={}, qclass={}",
-                    src, id, qname, qtype_u16, qclass_u16
-                );
-
-                let header = DnsHeader::response_with_id_full(id, opcode, rd);
-                let question = Question::with_type_class(&qname, qtype, qclass);
-
-                let answer = Answer::new(&qname, [8, 8, 8, 8], 60);
-
-                let writer = MessageWriter::new(header, question, answer);
+                let header =
+                    DnsHeader::response_with_id_and_counts(id, opcode, rd, qdcount, qdcount, 0, 0);
+                let writer = MessageWriter::new_with_sections(header, questions, answers);
 
                 match writer.to_vec() {
                     Ok(resp) => match socket.send_to(&resp, src) {
