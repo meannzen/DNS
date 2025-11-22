@@ -110,6 +110,7 @@ impl Question {
     }
 }
 
+/// RDATA types. `Unknown` holds raw bytes for unsupported/unparsed types.
 pub enum RData {
     A([u8; 4]),
     CNAME(String),
@@ -135,12 +136,15 @@ impl Answer {
         }
     }
 
+    /// Encode the answer into `buf` starting at offset 0 and return number of bytes written.
     pub fn encode(&self, buf: &mut [u8]) -> Result<usize> {
         let mut off = 0usize;
 
+        // encode NAME
         let written = encode_domain_name(&self.qname, &mut buf[off..])?;
         off += written;
 
+        // helper to write numbers
         fn write_u16(buf: &mut [u8], off: usize, val: u16) -> Result<()> {
             if off + 2 > buf.len() {
                 return Err(BufferError::EndOfBuffer);
@@ -159,6 +163,7 @@ impl Answer {
             Ok(())
         }
 
+        // TYPE
         let t = match self.qtype {
             QType::A => 1u16,
             QType::CNAME => 5u16,
@@ -166,6 +171,7 @@ impl Answer {
         write_u16(buf, off, t)?;
         off += 2;
 
+        // CLASS
         let c = match self.qclass {
             QClass::IN => 1u16,
             QClass::CS => 2u16,
@@ -173,12 +179,15 @@ impl Answer {
         write_u16(buf, off, c)?;
         off += 2;
 
+        // TTL
         write_u32(buf, off, self.ttl)?;
         off += 4;
 
+        // Reserve space for RDLENGTH (u16), we'll write actual RDATA after computing it
         let rdlength_pos = off;
-        off += 2;
+        off += 2; // placeholder for RDLENGTH
 
+        // Write RDATA based on variant
         let rdata_start = off;
         match &self.rdata {
             RData::A(a) => {
@@ -189,6 +198,7 @@ impl Answer {
                 off += 4;
             }
             RData::CNAME(name) => {
+                // encode domain name for the CNAME target
                 let written = encode_domain_name(name, &mut buf[off..])?;
                 off += written;
             }
@@ -201,6 +211,7 @@ impl Answer {
             }
         }
 
+        // compute and write RDLENGTH
         let rdlen = (off - rdata_start) as u16;
         if rdlength_pos + 2 > buf.len() {
             return Err(BufferError::EndOfBuffer);
@@ -329,6 +340,7 @@ impl MessageWriter {
         write_u16(buf, offset, qclass_u16)?;
         offset += 2;
 
+        // Answer section (write one answer if present)
         let answer_written = self.message.answer.encode(&mut buf[offset..])?;
         offset += answer_written;
 
@@ -380,16 +392,25 @@ impl DnsHeader {
     }
 
     pub fn response_with_id(id: u16) -> DnsHeader {
+        DnsHeader::response_with_id_full(id, 0, false)
+    }
+
+    pub fn response_with_id_and_rd(id: u16, recursion_desired: bool) -> DnsHeader {
+        DnsHeader::response_with_id_full(id, 0, recursion_desired)
+    }
+
+    pub fn response_with_id_full(id: u16, opcode: u8, recursion_desired: bool) -> DnsHeader {
+        let response_code = if opcode == 0 { 0 } else { 4 };
         DnsHeader {
             packet_id: id,
             query_response_indicator: true,
-            opcode: 0,
+            opcode,
             authoritative_answer: false,
             truncation: false,
-            recursion_desired: false,
+            recursion_desired,
             recursion_available: false,
             reserved: 0,
-            response_code: 0,
+            response_code,
             question_count: 1,
             answer_record_count: 0,
             authority_record_count: 0,
@@ -398,6 +419,8 @@ impl DnsHeader {
     }
 }
 
+/// Helper: encode a domain name (dot-separated) into DNS label format into `buf`.
+/// Returns number of bytes written.
 fn encode_domain_name(name: &str, buf: &mut [u8]) -> Result<usize> {
     let mut offset = 0usize;
 

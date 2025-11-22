@@ -38,7 +38,7 @@ fn parse_name(packet: &[u8], start_pos: usize) -> Result<(String, usize), String
                 return Err("pointer truncated".into());
             }
             let b2 = packet[pos + 1];
-            let pointer = (((len as u16 & 0x3F) as u16) << 8) | (b2 as u16);
+            let pointer = ((len as u16 & 0x3F) << 8) | (b2 as u16);
             let pointer = pointer as usize;
             if pointer >= packet.len() {
                 return Err("pointer out of range".into());
@@ -117,6 +117,10 @@ fn main() {
 
                 let id = u16::from_be_bytes([packet[0], packet[1]]);
 
+                let flags = u16::from_be_bytes([packet[2], packet[3]]);
+                let rd = ((flags >> 8) & 1) == 1;
+                let opcode = ((flags >> 11) & 0xF) as u8;
+
                 let qdcount = match read_u16_be(packet, 4) {
                     Some(v) => v,
                     None => {
@@ -159,7 +163,7 @@ fn main() {
                     src, id, qname, qtype_u16, qclass_u16
                 );
 
-                let header = DnsHeader::response_with_id(id);
+                let header = DnsHeader::response_with_id_full(id, opcode, rd);
                 let question = Question::with_type_class(&qname, qtype, qclass);
 
                 let answer = Answer::new(&qname, [8, 8, 8, 8], 60);
